@@ -125,6 +125,23 @@ export default function App() {
     }));
   };
 
+  const buildDemoAiReply = (disp, buyerText) => {
+    const firstName = (disp?.buyer_name || 'there').split(' ')[0];
+    const orderRef = disp?.order_id ? ` for order ${disp.order_id}` : '';
+    const lower = buyerText.toLowerCase();
+
+    if (lower.includes('spouse') || lower.includes('cancel')) {
+      return `Hi ${firstName}, glad you confirmed with your household! To close this case in PayPal, open your Resolution Center claim${orderRef} and select "Cancel / Close dispute" (reason: recognized purchase). Our records already show verified device match (${disp?.device_hash || 'verified'}) and delivery via ${disp?.carrier || 'carrier'}.`;
+    }
+    if (lower.includes('found') || lower.includes('porch') || lower.includes('package')) {
+      return `Great news, ${firstName}! Thank you for confirming delivery${orderRef} under tracking ${disp?.tracking_number || 'on file'}. You can now mark the item as received in PayPal's Resolution Center to close the dispute—no further action needed on your end.`;
+    }
+    if (lower.includes('return') || lower.includes('rma') || lower.includes('label')) {
+      return `Of course, ${firstName}—we've generated your pre-paid ${disp?.carrier || 'UPS'} return label (${disp?.rma_number || `RMA-${disp?.order_id || '2026'}`}) for "${disp?.item_title || 'your item'}". Please drop the parcel off within 7 days and we'll process your replacement or refund immediately upon scan.`;
+    }
+    return `Hello ${firstName}, we've attached verified fulfillment and tracking evidence (${disp?.tracking_number || 'on file'}) for "${disp?.item_title || 'your order'}". Let us know if you'd like to confirm receipt or use our pre-paid return option.`;
+  };
+
   const handleSimulateBuyerReply = async (disputeId) => {
     const disp = disputes.find(d => d.dispute_id === disputeId);
     const buyerName = disp ? disp.buyer_name : "Buyer";
@@ -142,14 +159,25 @@ export default function App() {
       return;
     }
 
-    setTimeout(() => {
-      handleSendMessage(disputeId, {
-        sender: 'buyer',
-        name: buyerName,
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    await handleSendMessage(disputeId, {
+      sender: 'buyer',
+      name: buyerName,
+      time: 'Just now',
+      text: randomReply,
+    });
+
+    const holdAutoReply = ['FLAGGED_HITL', 'RESOLVED', 'CONCEDED'].includes(disp?.pipeline_status);
+    if (!holdAutoReply) {
+      await new Promise((resolve) => setTimeout(resolve, 550));
+      await handleSendMessage(disputeId, {
+        sender: 'bot',
+        name: 'LexiShield AI Assistant',
         time: 'Just now',
-        text: randomReply
+        isAiReply: true,
+        text: buildDemoAiReply(disp, randomReply),
       });
-    }, 500);
+    }
   };
 
   return (
