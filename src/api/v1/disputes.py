@@ -13,9 +13,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from src.core.exceptions import DisputeNotFoundError
+from src.models.arbitration import ArbitrationAction, ArbitrationDecision
 from src.models.schemas import (
     BuyerInfo,
     DisputedTransaction,
+    DisputeReason,
     DisputeRecord,
     DisputeStage,
     DisputeStatsSummary,
@@ -102,6 +104,179 @@ async def get_dispute(
     return record
 
 
+_DEMO_DOSSIER_SPECS: dict[str, dict[str, str | float]] = {
+    "PP-D-99412": {
+        "order_id": "ORD-ZAP-99412",
+        "customer_name": "Elena Rostova",
+        "customer_email": "elena.rostova@example.com",
+        "amount": 349.00,
+        "reason": DisputeReason.MERCHANDISE_OR_SERVICE_NOT_AS_DESCRIBED.value,
+        "stage": DisputeStage.CLAIM.value,
+        "specialist_agent": "SNADAgent",
+        "win_probability": 0.92,
+        "action": ArbitrationAction.PROVIDE_EVIDENCE.value,
+        "summary": "Outbound calibrated scale weight matched catalog tare weight (0.0% variance). Hardware serial SN-SHURE-SM7B-4412 logged and verified.",
+    },
+    "PP-D-77194": {
+        "order_id": "ORD-ZAP-77194",
+        "customer_name": "Samantha Cole",
+        "customer_email": "samantha.cole@outlook.com",
+        "amount": 299.99,
+        "reason": DisputeReason.UNAUTHORISED.value,
+        "stage": DisputeStage.CLAIM.value,
+        "specialist_agent": "FraudAgent",
+        "win_probability": 0.98,
+        "action": ArbitrationAction.PROVIDE_EVIDENCE.value,
+        "summary": "Visa Compelling Evidence 3.0 (CE 3.0) liability shift qualified: prior undisputed orders matching IP, device fingerprint, and confirmed shipping address.",
+    },
+    "PP-D-55210": {
+        "order_id": "ORD-ZAP-55210",
+        "customer_name": "Sophia Chen",
+        "customer_email": "sophia.chen@enterprise.io",
+        "amount": 79.00,
+        "reason": DisputeReason.CANCELED_RECURRING_BILLING.value,
+        "stage": DisputeStage.INQUIRY.value,
+        "specialist_agent": "BillingAgent",
+        "win_probability": 0.95,
+        "action": ArbitrationAction.SEND_MESSAGE.value,
+        "summary": "Customer assented to recurring Terms of Service at checkout. Active server sessions and telemetry recorded post-renewal.",
+    },
+    "PP-D-44102": {
+        "order_id": "ORD-ZAP-44102",
+        "customer_name": "Liam Smith",
+        "customer_email": "liam.smith@example.com",
+        "amount": 35.00,
+        "reason": DisputeReason.OTHER.value,
+        "stage": DisputeStage.CLAIM.value,
+        "specialist_agent": "BillingAgent",
+        "win_probability": 0.15,
+        "action": ArbitrationAction.ACCEPT_CLAIM.value,
+        "summary": "Billing credit discrepancy verified from customer support logs. Early concession recommended to avoid penalty fees.",
+    },
+    "PP-D-66305": {
+        "order_id": "ORD-ZAP-66305",
+        "customer_name": "Jordan Lee",
+        "customer_email": "jordan.lee@techcorp.io",
+        "amount": 849.00,
+        "reason": DisputeReason.MERCHANDISE_OR_SERVICE_NOT_RECEIVED.value,
+        "stage": DisputeStage.CLAIM.value,
+        "specialist_agent": "INRAgent",
+        "win_probability": 0.88,
+        "action": ArbitrationAction.FLAG_FOR_HITL.value,
+        "summary": "High order value ($849.00 > $300.00 threshold). Delivery confirmed with recipient signature 'J. LEE' under PayPal §11.",
+    },
+    "PP-D-88201": {
+        "order_id": "ORD-ZAP-10294",
+        "customer_name": "Marcus Vance",
+        "customer_email": "marcus.vance@gmail.com",
+        "amount": 249.99,
+        "reason": DisputeReason.MERCHANDISE_OR_SERVICE_NOT_RECEIVED.value,
+        "stage": DisputeStage.INQUIRY.value,
+        "specialist_agent": "INRAgent",
+        "win_probability": 0.94,
+        "action": ArbitrationAction.PROVIDE_EVIDENCE.value,
+        "summary": "Carrier verified delivery at confirmed address with courier drop-off GPS (34.0983, -118.3267) and signed recipient proof 'M. VANCE'.",
+    },
+}
+
+
+async def _compile_pdf_for_dispute(
+    dispute_id: str,
+    pipeline: DisputePipeline,
+    *,
+    order_id: str,
+    customer_name: str,
+    customer_email: str,
+    amount: float,
+    currency: str,
+    reason: DisputeReason,
+    stage: DisputeStage,
+    specialist_agent: str,
+    win_probability: float,
+    action: ArbitrationAction,
+    rebuttal_statement: str,
+    file_path: str,
+    existing_record: DisputeRecord | None = None,
+) -> tuple[str, str]:
+    """Compile or rebuild a ReportLab evidentiary PDF dossier and return `(path, sha256)`."""
+    order = (
+        existing_record.telemetry_order if existing_record else None
+    ) or await pipeline.order_service.get_order_by_transaction_or_id(
+        order_id=order_id,
+        disputed_amount=amount,
+        customer_name=customer_name,
+        customer_email=customer_email,
+    )
+    carrier = (
+        existing_record.telemetry_carrier if existing_record else None
+    ) or await pipeline.carrier_service.get_tracking(
+        order_id=order_id,
+        customer_name=customer_name,
+        customer_email=customer_email,
+    )
+    warehouse = (
+        existing_record.telemetry_warehouse if existing_record else None
+    ) or await pipeline.warehouse_service.get_fulfillment_telemetry(order_id=order_id)
+    billing = (
+        existing_record.telemetry_billing if existing_record else None
+    ) or await pipeline.billing_service.get_billing_telemetry(order_id=order_id, order=order)
+
+    dispute_res = PayPalDisputeResource(
+        dispute_id=dispute_id,
+        create_time=(
+            existing_record.created_at.isoformat()
+            if existing_record
+            else datetime.now(UTC).isoformat()
+        ),
+        dispute_amount=Money(currency_code=currency, value=f"{amount:.2f}"),
+        dispute_stage=stage,
+        dispute_reason=reason,
+    )
+    compliance_result = pipeline.compliance_engine.audit_dispute(dispute_res, carrier, order)
+    ce3_result = pipeline.visa_ce3_engine.evaluate_ce3_eligibility(
+        order=order,
+        current_ip=order.checkout_ip,
+        current_device_fingerprint=order.device_fingerprint,
+    )
+    decision = ArbitrationDecision(
+        dispute_id=dispute_id,
+        win_probability=win_probability,
+        expected_value=round(win_probability * amount - (1.0 - win_probability) * 15.0, 2),
+        recommended_action=action,
+        hitl_flagged=bool(existing_record.hitl_flagged)
+        if existing_record
+        else action == ArbitrationAction.FLAG_FOR_HITL,
+        hitl_reasons=list(existing_record.hitl_reasons) if existing_record else [],
+        executive_summary=rebuttal_statement,
+        rebuttal_statement=rebuttal_statement,
+        specialist_agent=specialist_agent,
+        persona_mode=(existing_record.persona_mode if existing_record else None)
+        or "ADVERSARIAL_LEGAL_DEFENSE",
+        llm_tier_used=(existing_record.llm_tier_used if existing_record else None)
+        or "TIER_3_DETERMINISTIC_HEURISTIC",
+        reasoning_steps=list(existing_record.reasoning_steps) if existing_record else [],
+        seller_rights_met=(
+            bool(existing_record.seller_rights_met)
+            if existing_record and existing_record.seller_rights_met is not None
+            else compliance_result.is_eligible
+        ),
+    )
+
+    os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+    _, sha256 = pipeline.pdf_generator.generate_rebuttal_dossier_with_hash(
+        dispute=dispute_res,
+        decision=decision,
+        carrier=carrier,
+        warehouse=warehouse,
+        order=order,
+        compliance_result=compliance_result,
+        ce3_result=ce3_result,
+        billing_result=billing,
+        file_path=file_path,
+    )
+    return file_path, sha256
+
+
 @router.get(
     "/{dispute_id}/pdf",
     summary="Download Evidentiary Rebuttal PDF",
@@ -113,21 +288,74 @@ async def download_pdf_dossier(
 ) -> FileResponse:
     record = pipeline.get_record(dispute_id)
     if not record:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Dispute '{dispute_id}' not found.",
+        demo_spec = _DEMO_DOSSIER_SPECS.get(dispute_id)
+        if not demo_spec:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Dispute '{dispute_id}' not found.",
+            )
+        demo_path = os.path.join(
+            pipeline.pdf_generator.output_dir, f"dispute_{dispute_id}_evidence.pdf"
+        )
+        demo_pdf_path, demo_sha256 = await _compile_pdf_for_dispute(
+            dispute_id,
+            pipeline,
+            order_id=str(demo_spec["order_id"]),
+            customer_name=str(demo_spec["customer_name"]),
+            customer_email=str(demo_spec["customer_email"]),
+            amount=float(demo_spec["amount"]),
+            currency="USD",
+            reason=DisputeReason(str(demo_spec["reason"])),
+            stage=DisputeStage(str(demo_spec["stage"])),
+            specialist_agent=str(demo_spec["specialist_agent"]),
+            win_probability=float(demo_spec["win_probability"]),
+            action=ArbitrationAction(str(demo_spec["action"])),
+            rebuttal_statement=str(demo_spec["summary"]),
+            file_path=demo_path,
+        )
+        return FileResponse(
+            path=demo_pdf_path,
+            media_type="application/pdf",
+            filename=f"PayPal_Evidence_{dispute_id}.pdf",
+            headers={"X-Dossier-SHA256": demo_sha256},
         )
 
-    pdf_path = record.pdf_dossier_path
-    if not pdf_path or not os.path.exists(pdf_path):
+    stored_path = record.pdf_dossier_path
+    if not stored_path:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No PDF evidentiary dossier found for dispute '{dispute_id}'.",
         )
 
+    pdf_path: str = stored_path
+    sha256: str | None = record.pdf_dossier_sha256
+    if not os.path.exists(pdf_path):
+        order_ref = record.order_id or f"ORD-{dispute_id}"
+        pdf_path, sha256 = await _compile_pdf_for_dispute(
+            dispute_id,
+            pipeline,
+            order_id=order_ref,
+            customer_name=(record.telemetry_order.customer_name if record.telemetry_order else None)
+            or "Verified Customer",
+            customer_email=record.customer_email or "customer@lexishield.io",
+            amount=record.amount,
+            currency=record.currency,
+            reason=record.reason,
+            stage=record.stage,
+            specialist_agent=record.specialist_agent or "DisputeSupervisor",
+            win_probability=record.win_probability if record.win_probability is not None else 0.85,
+            action=ArbitrationAction(
+                record.recommended_action or ArbitrationAction.PROVIDE_EVIDENCE.value
+            ),
+            rebuttal_statement=record.rebuttal_statement or "Evidentiary dossier compiled.",
+            file_path=pdf_path,
+            existing_record=record,
+        )
+        record.pdf_dossier_sha256 = sha256
+
     headers: dict[str, str] = {}
-    if record.pdf_dossier_sha256:
-        headers["X-Dossier-SHA256"] = record.pdf_dossier_sha256
+    if sha256:
+        headers["X-Dossier-SHA256"] = sha256
 
     return FileResponse(
         path=pdf_path,

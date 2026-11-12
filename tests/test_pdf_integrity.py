@@ -272,3 +272,16 @@ async def test_sqlite_db_persistence_and_sync_roundtrip(tmp_path, monkeypatch):
     assert reloaded.pdf_dossier_sha256 == saved.pdf_dossier_sha256
     assert reloaded.seller_rights_met is True
     assert reloaded.telemetry_billing is not None
+
+
+@pytest.mark.asyncio
+async def test_demo_dispute_pdf_download_and_missing_dispute_404(async_client):
+    """Demo dossier IDs from the UI compile a real PDF dossier on demand, while unknown IDs return 404."""
+    resp = await async_client.get("/api/v1/disputes/PP-D-88201/pdf")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/pdf")
+    assert resp.content.startswith(b"%PDF-")
+    assert resp.headers["X-Dossier-SHA256"] == hashlib.sha256(resp.content).hexdigest()
+
+    missing = await async_client.get("/api/v1/disputes/PP-D-UNKNOWN-999/pdf")
+    assert missing.status_code == 404
